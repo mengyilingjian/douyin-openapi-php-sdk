@@ -33,12 +33,13 @@ class BaseApi
         return json_decode($this->response, true);
     }
 
-    public function https_post($url, $data = [])
+    public function https_post($url, $data = [], $header = ['Content-Type: application/json'])
     {
-        $header = [
-            'Content-Type:application/json', 'Access-Token:' . $this->access_token
+        $defaultHeader = [
+            'Access-Token: ' . $this->access_token
         ];
-        $this->response = $this->https_request($url, json_encode($data), $header);
+        $defaultHeader = array_merge($header, $defaultHeader);
+        $this->response = $this->https_request($url, json_encode($data), $defaultHeader);
         return json_decode($this->response, true);
     }
 
@@ -66,6 +67,12 @@ class BaseApi
         return ($output);
     }
 
+    /**
+     * 流文件请求方法
+     * @param $url
+     * @param $file
+     * @return mixed
+     */
     public function https_byte($url, $file)
     {
         $payload = '';
@@ -85,6 +92,7 @@ class BaseApi
         $request_headers = array();
         $request_headers[] = 'Content-Length: ' . strlen($params);
         $request_headers[] = 'Content-Type: multipart/form-data; boundary=' . $multipart_boundary;
+        $request_headers[] = 'Access-Token: ' . $this->access_token;
 
         $curl = curl_init($url);
         curl_setopt($curl, CURLOPT_POST, 1);

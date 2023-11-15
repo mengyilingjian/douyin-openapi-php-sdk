@@ -2,6 +2,10 @@
 namespace DouYin\OpenAPI\Base;
 
 use DouYin\OpenAPI\Base\Core\BaseApi;
+use DouYin\OpenAPI\DouYin;
+use Exception;
+use Generator;
+use think\db\exception\BindParamException;
 
 class Video extends BaseApi
 {
@@ -15,7 +19,7 @@ class Video extends BaseApi
         ];
         $api = $api . '?' . http_build_query($params);
 
-        return $this->https_post($api, ["item_ids" => $item_ids], true);
+        return $this->https_post($api, ["item_ids" => $item_ids]);
     }
 
     //查询授权账号视频列表
@@ -75,17 +79,129 @@ class Video extends BaseApi
     }
 
     //上传视频分片到文件服务器
-    public function video_part_upload($open_id, $upload_id, $part_number, $video)
+    public function video_part_upload($open_id, $upload_id, $part_number, $tempFilePath)
     {
         $params = [
             'open_id' => $open_id,
-            'access_token' => $this->access_token,
-            'upload_id' => $upload_id,
             'part_number' => $part_number,
+            'upload_id' => $upload_id,
         ];
         $url = self::Douyin_Url . '/api/douyin/v1/video/upload_video_part/?' . http_build_query($params);
+        return $this->https_byte($url, $tempFilePath);
+    }
 
-        return $this->https_byte($url, $video);
+    /***
+     * @param $videoUrl | 源视频地址
+     * @param $open_id
+     * @param $input
+     * @param $output
+     * @return int|mixed
+     * @throws Exception
+     */
+    public function uploadVideo($videoId, $videoUrl, $open_id) {
+        $videoByteSize = $this->getContentSizeByUrl($videoUrl); // 224499914
+        if ($videoByteSize <= 0) {
+            throw new Exception("文件大小获取异常", 400);
+        }
+        if ($videoByteSize > DouYin::Chip_Total_Video_Size) {
+            throw new Exception("视频总大小超过4GB", 400);
+        } elseif ($videoByteSize > DouYin::Chip_Upload_Size) {
+            // 视频超过50M，强制分片上传
+            // 初始化
+            $chip_upload_init = $this->video_part_init($open_id);
+            print_r("视频 {$videoId} 分片上传初始化..." . "\r\n");
+            if ($chip_upload_init['data']['error_code'] !== 0) {
+                // 请求接口初始化失败，跳出循环
+                $msg = "分片上传初始化失败，原因：{$chip_upload_init['data']['description']}";
+                throw new Exception($msg, 400);
+            }
+
+            $upload_id = $chip_upload_init['data']['upload_id'];
+            $uploadGenerator = $this->uploadChunks($videoId, $videoByteSize, $videoUrl, $open_id, $upload_id);
+            if (!$uploadGenerator->valid()) {
+                throw new Exception("源视频{$videoId}分片失败,请联系管理员", 400);
+            }
+            foreach ($uploadGenerator as $part => $chip_upload_res) {
+                // 处理每个分片上传的结果
+                // 可以执行额外的操作，如记录日志、更新进度等
+                print_r(json_encode(['code' => 0, 'message' => "视频 {$videoId} 第 {$part} 片上传结果", 'data' => $chip_upload_res], JSON_UNESCAPED_UNICODE) . "\r\n");
+            }
+            unset($chip_upload_init, $uploadGenerator);
+            $data = $this->video_part_complete($open_id, $upload_id);
+            print_r(json_encode(['code' => 0, 'message' => '分片上传完成', 'data' => $data], JSON_UNESCAPED_UNICODE) . "\r\n");
+        } else {
+            // 不符合分片要求,直接上传
+            print_r("视频 {$videoId} 开始上传..." . "\r\n");
+            $data = $this->video_upload($open_id, $videoUrl);
+            print_r(json_encode(['code' => 0, 'message' => '视频上传完成', 'data' => $data], JSON_UNESCAPED_UNICODE));
+        }
+        return $data;
+    }
+
+    /***
+     * 对视频进行切割分片
+     * @param $videoId | 视频id,用来区分切片数据
+     * @param $videoByteSize |视频大小
+     * @param $MediaURL |源视频,用来切割视频
+     * @param $open_id
+     * @param $upload_id
+     * @return Generator
+     */
+    public function uploadChunks($videoId, $videoByteSize, $MediaURL, $open_id, $upload_id): Generator
+    {
+        try {
+            if ($videoByteSize <= 0) {
+                $videoByteSize = $this->getContentSizeByUrl($MediaURL);
+            }
+            if ($videoByteSize < DouYin::Chip_Min_Size) {
+                throw new Exception('视频切片字节不能小于5M', 400);
+            }
+            $fileCount = ceil($videoByteSize / DouYin::Chip_Size);
+            $tempDir = DouYin::Chunk_Cache_Dir;
+            if (!is_dir($tempDir)) {
+                mkdir($tempDir, 0777, true);
+            }
+            $chunkDataContainer = [];
+            //  echo '当前视频切片数量为'. $fileCount . "\n";
+            $videoByteData = file_get_contents($MediaURL);
+            for ($i = 0; $i < $fileCount; $i++) {
+                $part_number = $i + 1;
+                $start = $i * DouYin::Chip_Size;
+                $end = min(($i + 1) * DouYin::Chip_Size - 1, $videoByteSize - 1);
+                $data = substr($videoByteData, $start, $end - $start + 1);
+                // echo "第{$part_number}部分数据,i:{$i},大小为". strlen($data) . "\n";
+                if ($i == $fileCount -1 && strlen($data) < DouYin::Chip_Min_Size) {
+                    // 最后一片小于5M,则与上一片拼接,并替换到缓存容器中
+                    $prvChunkData = $chunkDataContainer[$i - 1];
+                    $chunkData = [
+                        'data' => $prvChunkData['data'].$data,
+                        'part' => $prvChunkData['part'],
+                        'size' => strlen($prvChunkData['data'].$data)
+                    ];
+                    $chunkDataContainer[$i - 1] = $chunkData;
+                    break;
+                }
+                $chunkData = [
+                    'data' => $data,
+                    'part' => $part_number,
+                    'size' => strlen($data)
+                ];
+                $chunkDataContainer[] = $chunkData; // 将所有切片数据缓存
+            }
+            //  echo "开始进行分片上传, 分片数量为". count($chunkDataContainer);
+            for ($j = 0; $j < count($chunkDataContainer); $j++) {
+                $chunkData = $chunkDataContainer[$j];
+            //  echo '开始切片上传第'. $chunkData['part'] . '部分,大小为' . $chunkData['size'] . "\n";
+                $tempFilePath = $tempDir . "chunk_{$videoId}_part{$i}.mp4";
+                file_put_contents($tempFilePath, $chunkData['data']); // 缓存分片的数据
+                yield $this->video_part_upload($open_id, $upload_id, $chunkData['part'], $tempFilePath);
+                unlink($tempFilePath); // 删除缓存文件
+            }
+            unset($chunkDataContainer, $videoByteData);
+        } catch (Exception $e) {
+            echo '视频切片报错了:'.$e->getMessage();
+            return [];
+        }
     }
 
     //分片完成上传
@@ -130,5 +246,25 @@ class Video extends BaseApi
             'date_type'     => $date_type,
         ];
         return $this->https_get($api_url , $params);
+    }
+
+    public function getContentSizeByUrl($url): ?int
+    {
+        $url = parse_url($url);
+        if ($fp = @fsockopen($url['host'], empty($url['port']) ? 80 : $url['port'], $error)) {
+            fputs($fp, "GET " . (empty($url['path']) ? '/' : $url['path']) . " HTTP/1.1\r\n");
+            fputs($fp, "Host:$url[host]\r\n\r\n");
+            while (!feof($fp)) {
+                $tmp = fgets($fp);
+                if (trim($tmp) == '') {
+                    break;
+                } else if (preg_match('/Content-Length:(.*)/si', $tmp, $arr)) {
+                    return trim($arr[1]);
+                }
+            }
+            return 0;
+        } else {
+            return 0;
+        }
     }
 }
